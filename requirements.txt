@@ -1,0 +1,5 @@
+mcp>=1.25.0
+httpx>=0.28.0
+pydantic>=2.10.0
+python-dotenv>=1.0.0
+azure-identity>=1.15.0
