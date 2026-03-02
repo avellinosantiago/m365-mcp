@@ -1,12 +1,12 @@
-# M365 Planner MCP Server
+# M365 MCP Servers
 
-MCP (Model Context Protocol) server for Microsoft 365 Planner integration with Claude Code and Claude Desktop.
+MCP (Model Context Protocol) servers for Microsoft 365 integration with Claude Code and Claude Desktop.
 
-Enables AI assistants to manage Planner tasks, buckets, and plans via Microsoft Graph API.
+Enables AI assistants to manage Planner tasks and Outlook emails via Microsoft Graph API.
 
 ## Features
 
-### Task Management
+### Planner - Task Management
 | Tool | Description |
 |------|-------------|
 | `planner_list_tasks` | List tasks in a plan (filter by bucket, completion status) |
@@ -18,11 +18,25 @@ Enables AI assistants to manage Planner tasks, buckets, and plans via Microsoft 
 | `planner_complete_task` | Mark a task as complete |
 | `planner_update_details` | Update task description and checklist items |
 
-### Bucket Management
+### Planner - Bucket Management
 | Tool | Description |
 |------|-------------|
 | `planner_list_buckets` | List all buckets in a plan |
 | `planner_create_bucket` | Create a new bucket |
+
+### Outlook - Email Management
+| Tool | Description |
+|------|-------------|
+| `outlook_list_folders` | List mail folders with unread counts (supports subfolders) |
+| `outlook_list_messages` | List messages in a folder (default: inbox), filter by read status |
+| `outlook_search_messages` | Search emails by text, sender, or subject |
+| `outlook_get_message` | Read full email (body, headers, attachments) |
+| `outlook_create_draft` | Create a draft email with To, CC, Subject, HTML Body |
+| `outlook_send_draft` | Send an existing draft |
+| `outlook_reply_draft` | Create a reply/reply-all draft |
+| `outlook_move_message` | Move email to another folder |
+| `outlook_mark_read` | Mark email as read/unread |
+| `outlook_create_folder` | Create a new mail folder (supports subfolders) |
 
 ## Prerequisites
 
@@ -45,7 +59,7 @@ pip install -r requirements.txt
 ```
 
 ### 3. Microsoft 365 Access
-You need a Microsoft 365 account with Planner access (Business Basic or higher).
+You need a Microsoft 365 account with Planner and Outlook access (Business Basic or higher).
 
 ## Installation
 
@@ -73,7 +87,11 @@ You need a Microsoft 365 account with Planner access (Business Basic or higher).
 ### For Claude Code CLI
 
 ```bash
+# Planner
 claude mcp add -s user -e "PATH=/path/to/azure/cli" m365-planner -- python /path/to/m365-mcp/m365_planner_mcp.py
+
+# Outlook
+claude mcp add -s user -e "PATH=/path/to/azure/cli" m365-outlook -- python /path/to/m365-mcp/m365_outlook_mcp.py
 ```
 
 Or add to your Claude settings (`~/.claude.json`):
@@ -84,6 +102,11 @@ Or add to your Claude settings (`~/.claude.json`):
     "m365-planner": {
       "command": "python",
       "args": ["/path/to/m365-mcp/m365_planner_mcp.py"],
+      "env": {}
+    },
+    "m365-outlook": {
+      "command": "python",
+      "args": ["/path/to/m365-mcp/m365_outlook_mcp.py"],
       "env": {}
     }
   }
@@ -101,6 +124,11 @@ Or add to your Claude settings (`~/.claude.json`):
     "m365-planner": {
       "command": "python",
       "args": ["/path/to/m365-mcp/m365_planner_mcp.py"],
+      "env": {}
+    },
+    "m365-outlook": {
+      "command": "python",
+      "args": ["/path/to/m365-mcp/m365_outlook_mcp.py"],
       "env": {}
     }
   }
@@ -135,6 +163,22 @@ Once configured, ask Claude to:
 ### Buckets
 > "List all buckets in the plan"
 > "Create a new bucket called 'Sprint 5'"
+
+### Outlook - Reading emails
+> "Show me my unread emails"
+> "Search for emails from john@company.com about the budget"
+> "Read the latest email from the IT team"
+> "List my mail folders"
+
+### Outlook - Drafts and replies
+> "Draft an email to john@company.com about the meeting tomorrow"
+> "Reply to that email saying I'll attend"
+> "Send the draft I just created"
+
+### Outlook - Organization
+> "Move that email to the Projects folder"
+> "Mark those emails as read"
+> "Create a new folder called 'Vendors'"
 
 ## Authentication
 
@@ -171,6 +215,7 @@ Your account doesn't have Planner access. Check your M365 license.
 ```
 m365-mcp/
 ├── m365_planner_mcp.py  # Planner MCP server
+├── m365_outlook_mcp.py  # Outlook MCP server
 ├── requirements.txt     # Python dependencies
 ├── .env.example         # Environment template
 ├── .env                 # Your configuration (not committed)
@@ -181,7 +226,6 @@ m365-mcp/
 ## Roadmap
 
 Future MCP servers planned for this repo:
-- **Outlook** - Email search, drafts, folder management
 - **SharePoint** - File navigation, upload/download, list management
 
 ## License
