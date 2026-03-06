@@ -52,32 +52,98 @@ def _get_outlook():
 
 
 def _get_store(namespace):
-    """Find the correct mail store."""
+    """Find the correct mail store.
+
+    Searches all Outlook stores for one matching STORE_FILTER,
+    excluding Public Folders (supports English and Spanish names).
+    Prefers exact email match over partial display name match.
+    """
+    PUBLIC_KEYWORDS = ("public", "pública", "públicas", "publica", "publicas")
+    available = []
+    candidates = []
     for s in namespace.Stores:
-        if STORE_FILTER in s.DisplayName.lower() and "public" not in s.DisplayName.lower():
+        display = s.DisplayName
+        available.append(display)
+        display_lower = display.lower()
+        if STORE_FILTER not in display_lower:
+            continue
+        if any(kw in display_lower for kw in PUBLIC_KEYWORDS):
+            continue
+        candidates.append(s)
+
+    _get_store._last_available = available
+
+    if not candidates:
+        return None
+
+    # Prefer exact email match (e.g. "savellino@megalabs.global")
+    for s in candidates:
+        if "@" in s.DisplayName:
             return s
-    return None
+
+    return candidates[0]
 
 
 def _resolve_folder(namespace, folder_id: str):
-    """Resolve a folder by well-known name or by navigating the folder tree by name path."""
+    """Resolve a folder by well-known name, path, exact name, or partial match.
+
+    Resolution order:
+    1. Well-known names: inbox, drafts, sentitems, deleteditems, junkemail, outbox
+    2. Path syntax: "parent/child" navigates the tree (e.g. "1. PROYECTOS/EVOCON")
+    3. Exact name match: case-insensitive search in top-level and one-level-deep folders
+    4. Partial match: if the search term is contained in the folder name (e.g. "EVOCON"
+       matches "1. PROYECTOS" subfolder "EVOCON", or "REGULATORIO" matches "3. REGULATORIO")
+    """
     lower = folder_id.lower().strip()
 
-    # Well-known folder
+    # 1) Well-known folder
     if lower in WELL_KNOWN_FOLDERS:
         return namespace.GetDefaultFolder(WELL_KNOWN_FOLDERS[lower])
 
-    # Try as folder name (search top-level folders in the store)
     store = _get_store(namespace)
-    if store:
-        root = store.GetRootFolder()
-        for f in root.Folders:
-            if f.Name.lower() == lower:
-                return f
-            # Also check one level deep
-            for sub in f.Folders:
-                if sub.Name.lower() == lower:
-                    return sub
+    if not store:
+        return None
+
+    root = store.GetRootFolder()
+
+    # 2) Path syntax: "parent/child" or "parent/child/grandchild"
+    if "/" in folder_id:
+        parts = [p.strip() for p in folder_id.split("/") if p.strip()]
+        current = root
+        for part in parts:
+            part_lower = part.lower()
+            found = None
+            for f in current.Folders:
+                if f.Name.lower() == part_lower:
+                    found = f
+                    break
+            if not found:
+                # Try partial match within this level
+                for f in current.Folders:
+                    if part_lower in f.Name.lower():
+                        found = f
+                        break
+            if not found:
+                return None
+            current = found
+        return current
+
+    # 3) Exact name match (top-level + one level deep)
+    for f in root.Folders:
+        if f.Name.lower() == lower:
+            return f
+        for sub in f.Folders:
+            if sub.Name.lower() == lower:
+                return sub
+
+    # 4) Partial/contains match (top-level first, then one level deep)
+    for f in root.Folders:
+        if lower in f.Name.lower():
+            return f
+    for f in root.Folders:
+        for sub in f.Folders:
+            if lower in sub.Name.lower():
+                return sub
 
     return None
 
@@ -176,7 +242,12 @@ def _sync_list_folders(parent_folder_name: str = None) -> str:
         outlook, namespace = _get_outlook()
         store = _get_store(namespace)
         if not store:
-            return json.dumps({"error": "Mail store not found"})
+            available = getattr(_get_store, '_last_available', [])
+            return json.dumps({
+                "error": f"Mail store not found for filter '{STORE_FILTER}'",
+                "available_stores": available,
+                "hint": "Check STORE_FILTER value or Outlook profile configuration",
+            }, ensure_ascii=False)
 
         if parent_folder_name:
             parent = _resolve_folder(namespace, parent_folder_name)
@@ -341,7 +412,7 @@ def _sync_get_message(entry_id: str, include_body: bool = True) -> str:
         pythoncom.CoUninitialize()
 
 
-def _sync_create_draft(subject: str, body: str, to: list, cc: list = None, importance: str = None) -> str:
+def _sync_create_draft(subject: str, body: str, to: list, cc: list = None, importance: str = None, display: bool = False) -> str:
     try:
         outlook, namespace = _get_outlook()
         mail = outlook.CreateItem(0)  # olMailItem
@@ -359,11 +430,29 @@ def _sync_create_draft(subject: str, body: str, to: list, cc: list = None, impor
 
         mail.Save()
 
+        # Verify the draft persisted
+        entry_id = mail.EntryID
+        verified = False
+        try:
+            saved = namespace.GetItemFromID(entry_id)
+            verified = saved is not None and saved.Subject == subject
+        except Exception:
+            pass
+
+        # Open the draft in Outlook if requested
+        if display:
+            try:
+                mail.Display()
+            except Exception:
+                pass
+
         return json.dumps({
             "status": "draft_created",
-            "entryID": mail.EntryID,
+            "entryID": entry_id,
             "subject": mail.Subject,
             "to": to,
+            "verified": verified,
+            "displayed": display,
         }, indent=2, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {str(e)}"})
@@ -479,6 +568,104 @@ def _sync_create_folder(display_name: str, parent_folder_name: str = None) -> st
         pythoncom.CoUninitialize()
 
 
+def _sync_search_gal(query: str, top: int = 10) -> str:
+    try:
+        outlook, namespace = _get_outlook()
+        gal = namespace.GetGlobalAddressList()
+        if not gal:
+            return json.dumps({"error": "Global Address List not available"})
+
+        entries = gal.AddressEntries
+        query_lower = query.lower()
+        results = []
+
+        for i in range(1, entries.Count + 1):
+            if len(results) >= top:
+                break
+            try:
+                entry = entries.Item(i)
+                name = entry.Name or ""
+                if query_lower not in name.lower():
+                    continue
+
+                record = {"name": name, "type": "unknown"}
+
+                # Try as Exchange User first
+                try:
+                    user = entry.GetExchangeUser()
+                    if user:
+                        record.update({
+                            "type": "user",
+                            "email": user.PrimarySmtpAddress or "",
+                            "jobTitle": user.JobTitle or "",
+                            "department": user.Department or "",
+                            "company": user.CompanyName or "",
+                        })
+                        results.append(record)
+                        continue
+                except Exception:
+                    pass
+
+                # Try as Distribution List
+                try:
+                    dl = entry.GetExchangeDistributionList()
+                    if dl:
+                        record.update({
+                            "type": "distribution_list",
+                            "email": dl.PrimarySmtpAddress or "",
+                        })
+                        results.append(record)
+                        continue
+                except Exception:
+                    pass
+
+                # Fallback: include with address if available
+                record["email"] = entry.Address or ""
+                results.append(record)
+            except Exception:
+                continue
+
+        return json.dumps({"count": len(results), "query": query, "results": results}, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {str(e)}"})
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def _sync_resolve_recipient(names: list) -> str:
+    try:
+        outlook, namespace = _get_outlook()
+        results = []
+
+        for name in names:
+            record = {"name": name, "resolved": False, "email": None, "displayName": None}
+            try:
+                recipient = namespace.CreateRecipient(name)
+                recipient.Resolve()
+                if recipient.Resolved:
+                    record["resolved"] = True
+                    record["displayName"] = recipient.Name or name
+                    entry = recipient.AddressEntry
+                    if entry:
+                        try:
+                            user = entry.GetExchangeUser()
+                            if user and user.PrimarySmtpAddress:
+                                record["email"] = user.PrimarySmtpAddress
+                            else:
+                                record["email"] = entry.Address or ""
+                        except Exception:
+                            record["email"] = entry.Address or ""
+            except Exception as e:
+                record["error"] = str(e)
+            results.append(record)
+
+        return json.dumps({"count": len(results), "results": results}, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {str(e)}"})
+    finally:
+        pythoncom.CoUninitialize()
+
+
 # =============================================================================
 # PYDANTIC INPUT MODELS
 # =============================================================================
@@ -561,6 +748,10 @@ class CreateDraftInput(BaseModel):
         default=None,
         description="Email importance: low, normal, high"
     )
+    display: bool = Field(
+        default=False,
+        description="Open the draft in Outlook after creation for visual review (default: False)"
+    )
 
 
 class SendDraftInput(BaseModel):
@@ -586,7 +777,12 @@ class MoveMessageInput(BaseModel):
     entry_id: str = Field(..., description="EntryID of the message to move")
     destination_folder: str = Field(
         ...,
-        description="Destination folder name or well-known name (inbox, drafts, sentitems, deleteditems, junkemail)"
+        description=(
+            "Destination folder. Supports: (1) well-known names: inbox, drafts, sentitems, deleteditems, junkemail; "
+            "(2) path syntax: 'PROYECTOS/EVOCON' or '1. PROYECTOS/EVOCON'; "
+            "(3) exact folder name: '3. REGULATORIO'; "
+            "(4) partial match: 'REGULATORIO' matches '3. REGULATORIO'"
+        ),
     )
 
 
@@ -607,6 +803,31 @@ class CreateFolderInput(BaseModel):
     parent_folder: Optional[str] = Field(
         default=None,
         description="Parent folder name to create subfolder. If not specified, creates at top level."
+    )
+
+
+class SearchGALInput(BaseModel):
+    """Input for searching the Global Address List."""
+    model_config = _model_config
+    query: str = Field(
+        ...,
+        min_length=2,
+        description="Search text to match against contact names (case-insensitive)"
+    )
+    top: int = Field(
+        default=10,
+        ge=1, le=50,
+        description="Max results to return (1-50, default 10)"
+    )
+
+
+class ResolveRecipientInput(BaseModel):
+    """Input for resolving names to SMTP email addresses."""
+    model_config = _model_config
+    names: list[str] = Field(
+        ...,
+        min_length=1,
+        description="List of names, aliases, or partial emails to resolve to SMTP addresses"
     )
 
 
@@ -736,13 +957,14 @@ async def outlook_create_draft(params: CreateDraftInput) -> str:
     """Create a draft email with To, CC, Subject, and HTML Body.
 
     The draft is saved in the Drafts folder for review before sending.
-    Use outlook_send_draft to send it.
+    Use outlook_send_draft to send it. Set display=true to open the draft
+    in Outlook for visual review (recommended).
 
     Args:
-        params: CreateDraftInput with subject, body, to, optional cc, importance
+        params: CreateDraftInput with subject, body, to, optional cc, importance, display
 
     Returns:
-        JSON with the created draft's entryID and subject
+        JSON with the created draft's entryID, subject, verified status, and displayed flag
     """
     return await asyncio.to_thread(
         _sync_create_draft,
@@ -751,6 +973,7 @@ async def outlook_create_draft(params: CreateDraftInput) -> str:
         params.to,
         params.cc,
         params.importance,
+        params.display,
     )
 
 
@@ -821,8 +1044,9 @@ async def outlook_reply_draft(params: ReplyDraftInput) -> str:
 async def outlook_move_message(params: MoveMessageInput) -> str:
     """Move an email to another folder.
 
-    Supports well-known folder names (inbox, drafts, sentitems, deleteditems,
-    junkemail) or folder names as they appear in Outlook.
+    Supports: well-known names (inbox, drafts, sentitems, deleteditems, junkemail),
+    path syntax ("1. PROYECTOS/EVOCON"), exact names ("3. REGULATORIO"),
+    or partial match ("REGULATORIO" finds "3. REGULATORIO").
 
     Args:
         params: MoveMessageInput with entry_id and destination_folder
@@ -886,6 +1110,63 @@ async def outlook_create_folder(params: CreateFolderInput) -> str:
         _sync_create_folder,
         params.display_name,
         params.parent_folder,
+    )
+
+
+@mcp.tool(
+    name="outlook_search_gal",
+    annotations={
+        "title": "Search Global Address List",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def outlook_search_gal(params: SearchGALInput) -> str:
+    """Search the Global Address List (GAL) by name.
+
+    Finds contacts, users, and distribution lists matching the query.
+    Returns name, email, job title, department, and company for each match.
+
+    Args:
+        params: SearchGALInput with query (min 2 chars) and optional top
+
+    Returns:
+        JSON list of matching GAL entries with contact details
+    """
+    return await asyncio.to_thread(
+        _sync_search_gal,
+        params.query,
+        params.top,
+    )
+
+
+@mcp.tool(
+    name="outlook_resolve_recipient",
+    annotations={
+        "title": "Resolve Recipient",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def outlook_resolve_recipient(params: ResolveRecipientInput) -> str:
+    """Resolve names or aliases to SMTP email addresses.
+
+    Uses Outlook's built-in recipient resolution to find the best match
+    for each name. Useful for verifying email addresses before creating drafts.
+
+    Args:
+        params: ResolveRecipientInput with list of names to resolve
+
+    Returns:
+        JSON list with resolved status, email, and display name for each input
+    """
+    return await asyncio.to_thread(
+        _sync_resolve_recipient,
+        params.names,
     )
 
 
